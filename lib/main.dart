@@ -600,7 +600,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             final ma60 = ma(closedCloses, 60);
             final ma120 = ma(closedCloses, 120);
 
-            if (ema20 == null || ema60 == null || ema120 == null || ma20 == null || ma60 == null || ma120 == null) {
+            if (ema20 == null ||
+                ema60 == null ||
+                ema120 == null ||
+                ma20 == null ||
+                ma60 == null ||
+                ma120 == null) {
               if (!mounted) return null;
               setState(() {
                 task.status = '[$localIdx/$total] $symbol 跳过(均线计算失败)';
@@ -773,174 +778,201 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
   @override
   Widget build(BuildContext context) {
+    const double taskPanelHeight = 300;
+    const double resultPanelHeight = 720;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Binance USDT EMA+MA(20/60/120) 扫描器')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Card(
-              elevation: 2,
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Text('周期:'),
-                        const SizedBox(width: 8),
-                        DropdownButton<String>(
-                          value: interval,
-                          items: const [
-                            DropdownMenuItem(value: '3m', child: Text('3m')),
-                            DropdownMenuItem(value: '15m', child: Text('15m')),
-                            DropdownMenuItem(value: '1h', child: Text('1h')),
-                            DropdownMenuItem(value: '4h', child: Text('4h')),
-                            DropdownMenuItem(value: '1d', child: Text('1d')),
-                          ],
-                          onChanged: (v) {
-                            if (v == null) return;
-                            setState(() {
-                              interval = v;
-                            });
-                          },
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Flexible(
-                          child: TextField(
-                            controller: _topNController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: false,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'topN',
-                              hintText: '例如 100',
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Flexible(
-                          child: TextField(
-                            controller: _thresholdController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: true,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'threshold',
-                              hintText: '例如 0.1',
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Flexible(
-                          child: TextField(
-                            controller: _klinesLimitController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: false,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'klinesLimit',
-                              hintText: '例如 150 (>=121)',
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Flexible(
-                          child: TextField(
-                            controller: _workersController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: false,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: 'workers',
-                              hintText: '并发数，例如 8',
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Flexible(
-                          child: TextField(
-                            controller: _newListingDaysController,
-                            keyboardType: const TextInputType.numberWithOptions(
-                              decimal: false,
-                            ),
-                            decoration: const InputDecoration(
-                              labelText: '天数',
-                              hintText: '例如 7',
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        ElevatedButton(
-                          onPressed: _addTask,
-                          child: const Text('添加任务'),
-                        ),
-                        const SizedBox(width: 8),
-                        OutlinedButton(
-                          onPressed: _clearResults,
-                          child: const Text('清空结果'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Flexible(
-                          fit: FlexFit.loose,
-                          child: OutlinedButton(
-                            onPressed: _scanNewListings,
-                            child: const Text('扫描新币(含天数和topN参数)'),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Checkbox(
-                              value: scanOnlyNew,
-                              onChanged: (v) {
-                                if (v == null) return;
-                                setState(() {
-                                  scanOnlyNew = v;
-                                });
-                              },
-                            ),
-                            const Text('仅在新币中扫描EMA'),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                minHeight: constraints.maxHeight - 32,
               ),
-            ),
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: Text(_status, style: const TextStyle(fontSize: 12)),
-            ),
-            const SizedBox(height: 8),
-            Expanded(
               child: Column(
                 children: [
-                  Expanded(
+                  Card(
+                    elevation: 2,
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Text('周期:'),
+                              const SizedBox(width: 8),
+                              DropdownButton<String>(
+                                value: interval,
+                                items: const [
+                                  DropdownMenuItem(
+                                    value: '3m',
+                                    child: Text('3m'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: '15m',
+                                    child: Text('15m'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: '1h',
+                                    child: Text('1h'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: '4h',
+                                    child: Text('4h'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: '1d',
+                                    child: Text('1d'),
+                                  ),
+                                ],
+                                onChanged: (v) {
+                                  if (v == null) return;
+                                  setState(() {
+                                    interval = v;
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                child: TextField(
+                                  controller: _topNController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: false,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: 'topN',
+                                    hintText: '例如 100',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: TextField(
+                                  controller: _thresholdController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: true,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: 'threshold',
+                                    hintText: '例如 0.1',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                child: TextField(
+                                  controller: _klinesLimitController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: false,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: 'klinesLimit',
+                                    hintText: '例如 150 (>=121)',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: TextField(
+                                  controller: _workersController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: false,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: 'workers',
+                                    hintText: '并发数，例如 8',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                child: TextField(
+                                  controller: _newListingDaysController,
+                                  keyboardType:
+                                      const TextInputType.numberWithOptions(
+                                        decimal: false,
+                                      ),
+                                  decoration: const InputDecoration(
+                                    labelText: '天数',
+                                    hintText: '例如 7',
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              ElevatedButton(
+                                onPressed: _addTask,
+                                child: const Text('添加任务'),
+                              ),
+                              const SizedBox(width: 8),
+                              OutlinedButton(
+                                onPressed: _clearResults,
+                                child: const Text('清空结果'),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: OutlinedButton(
+                                  onPressed: _scanNewListings,
+                                  child: const Text('扫描新币(含天数和topN参数)'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Checkbox(
+                                    value: scanOnlyNew,
+                                    onChanged: (v) {
+                                      if (v == null) return;
+                                      setState(() {
+                                        scanOnlyNew = v;
+                                      });
+                                    },
+                                  ),
+                                  const Text('仅在新币中扫描EMA'),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(_status, style: const TextStyle(fontSize: 12)),
+                  ),
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    height: taskPanelHeight,
                     child: Card(
                       elevation: 1,
                       child: _tasks.isEmpty
@@ -1008,7 +1040,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Expanded(
+                  SizedBox(
+                    height: resultPanelHeight,
                     child: Card(
                       elevation: 1,
                       child: Builder(
@@ -1048,8 +1081,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                 ],
               ),
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

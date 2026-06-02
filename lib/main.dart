@@ -11,6 +11,17 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'web_notifications/web_notification_service_stub.dart'
     if (dart.library.html) 'web_notifications/web_notification_service_web.dart';
 
+TextSpan boldSymbolSpan(String symbol) => TextSpan(
+  text: symbol,
+  style: const TextStyle(fontWeight: FontWeight.bold),
+);
+
+Widget symbolBoldText(String symbol, String suffix) {
+  return Text.rich(
+    TextSpan(children: [boldSymbolSpan(symbol), TextSpan(text: suffix)]),
+  );
+}
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
@@ -49,8 +60,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
   String interval = '1d';
   int topN = 100;
-  double threshold = 0.1;
-  int klinesLimit = 120;
+  double threshold = 0.2;
+  int klinesLimit = 1500;
   int workers = 8;
 
   static const Duration _fallbackContinuousDelay = Duration(seconds: 5);
@@ -69,8 +80,15 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   late TextEditingController _workersController;
   late TextEditingController _newListingDaysController;
 
-  int newListingDays = 7;
+  int newListingDays = 550;
   bool scanOnlyNew = false;
+
+  bool _postDenseTrendScanRunning = false;
+  bool _postDenseTrendBacktestRunning = false;
+  final List<PostDenseTrendResult> _postDenseTrendResults =
+      <PostDenseTrendResult>[];
+  final List<PostDenseTrendResult> _postDenseTrendBacktestResults =
+      <PostDenseTrendResult>[];
 
   void _log(String message) {
     debugPrint('[EMA] $message');
@@ -149,6 +167,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         task.isRunning = false;
         task.cancelRequested = false;
       }
+      _postDenseTrendResults.clear();
+      _postDenseTrendBacktestResults.clear();
       _status = '已清空所有任务结果';
     });
     _log('已清空所有任务结果');
@@ -222,8 +242,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: matches
                     .map(
-                      (m) => Text(
-                        '${m.symbol}  spread=${m.spreadPct.toStringAsFixed(4)}%',
+                      (m) => symbolBoldText(
+                        m.symbol,
+                        '  spread=${m.spreadPct.toStringAsFixed(4)}%',
                       ),
                     )
                     .toList(),
@@ -448,10 +469,538 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                   final d = r.listedAt.toUtc();
                   final date =
                       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
-                  return Text(
-                    '$date  ${r.symbol}  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                  return Text.rich(
+                    TextSpan(
+                      children: [
+                        TextSpan(text: '$date  '),
+                        boldSymbolSpan(r.symbol),
+                        TextSpan(
+                          text:
+                              '  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                        ),
+                      ],
+                    ),
                   );
                 }).toList(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _scanPostDenseTrend() async {
+    if (_postDenseTrendScanRunning) return;
+
+    final parsedTopN = int.tryParse(_topNController.text);
+    final parsedThreshold = double.tryParse(_thresholdController.text);
+    final parsedKlinesLimit = int.tryParse(_klinesLimitController.text);
+    final parsedWorkers = int.tryParse(_workersController.text);
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
+
+    if (parsedTopN == null ||
+        parsedTopN <= 0 ||
+        parsedThreshold == null ||
+        parsedThreshold <= 0 ||
+        parsedKlinesLimit == null ||
+        parsedKlinesLimit < 121 ||
+        parsedWorkers == null ||
+        parsedWorkers <= 0 ||
+        parsedDays <= 0) {
+      setState(() {
+        _status =
+            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数（>0）';
+      });
+      return;
+    }
+
+    topN = parsedTopN;
+    threshold = parsedThreshold;
+    klinesLimit = parsedKlinesLimit;
+    workers = parsedWorkers;
+    newListingDays = parsedDays;
+
+    setState(() {
+      _postDenseTrendScanRunning = true;
+      _postDenseTrendResults.clear();
+      _status =
+          '扫描密集后持续方向(周期 $interval, 上市≤${parsedDays}天, topN=$parsedTopN) ...';
+    });
+    _log(
+      '开始扫描密集后持续方向: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
+      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays',
+    );
+
+    try {
+      final symbols = await fetchTopSymbolsByQuoteVolume(
+        parsedTopN,
+        maxListingDays: parsedDays,
+      );
+
+      if (symbols.isEmpty) {
+        setState(() {
+          _status = '未获取到任何 symbol';
+        });
+        _log('密集后持续方向扫描：未获取到任何 symbol');
+        return;
+      }
+
+      final matches = <PostDenseTrendResult>[];
+      final total = symbols.length;
+      var idx = 0;
+
+      Future<PostDenseTrendResult?> worker(int localIdx, String symbol) async {
+        try {
+          final indicatorLimit = math.min(
+            math.max(klinesLimit, _indicatorWarmupKlines),
+            _binanceKlinesMaxLimit,
+          );
+          final bars = await fetchKlineBars(symbol, interval, indicatorLimit);
+          if (bars.length < 122) {
+            _log('[$localIdx/$total] $symbol 跳过(数据不足)');
+            return null;
+          }
+
+          final trend = detectPostDenseTrend(
+            bars,
+            threshold: parsedThreshold,
+          );
+          if (trend == null) {
+            _log('[$localIdx/$total] $symbol 不满足密集后持续方向');
+            return null;
+          }
+
+          final result = PostDenseTrendResult.fromDetection(symbol, trend);
+          _log(
+            '[$localIdx/$total] $symbol 命中 '
+            '${result.directionLabel} '
+            '${result.timeRangeLabel} '
+            '密集spread=${result.denseSpreadPct.toStringAsFixed(4)}% '
+            '持续${trend.barsSinceDense}根 '
+            '净变动=${result.netMovePct.toStringAsFixed(4)}% '
+            '贴MA20=${result.alongMa20Pct.toStringAsFixed(1)}% '
+            '均偏差=${result.avgMa20DevPct.toStringAsFixed(4)}%',
+          );
+          return result;
+        } catch (e) {
+          _log('[$localIdx/$total] $symbol 失败: $e');
+          return null;
+        }
+      }
+
+      var i = 0;
+      while (i < total) {
+        final end = (i + workers) > total ? total : (i + workers);
+        final batch = symbols.sublist(i, end);
+        final futures = <Future<PostDenseTrendResult?>>[];
+        for (final symbol in batch) {
+          idx += 1;
+          futures.add(worker(idx, symbol));
+        }
+        final batchResults = await Future.wait(futures);
+        for (final r in batchResults) {
+          if (r != null) {
+            matches.add(r);
+          }
+        }
+        if (mounted) {
+          setState(() {
+            _status =
+                '扫描密集后持续方向 [$idx/$total]，已找到 ${matches.length} 个';
+          });
+        }
+        i = end;
+      }
+
+      matches.sort((a, b) => b.netMovePct.abs().compareTo(a.netMovePct.abs()));
+
+      if (!mounted) return;
+      setState(() {
+        _postDenseTrendResults.addAll(matches);
+        _status =
+            '密集后持续方向扫描完成，共找到 ${matches.length} 个 (周期 $interval, 上市≤${parsedDays}天)';
+      });
+      _log('密集后持续方向扫描完成，匹配数量: ${matches.length}');
+
+      if (matches.isNotEmpty) {
+        await _showPostDenseTrendDialog(matches);
+      } else {
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: Text('密集后持续方向 (周期 $interval, 上市≤${parsedDays}天)'),
+              content: const Text('未发现满足条件的币种。'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = '密集后持续方向扫描失败: $e';
+        });
+      }
+      _log('密集后持续方向扫描失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _postDenseTrendScanRunning = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _backtestPostDenseTrend() async {
+    if (_postDenseTrendBacktestRunning) return;
+
+    final parsedTopN = int.tryParse(_topNController.text);
+    final parsedThreshold = double.tryParse(_thresholdController.text);
+    final parsedKlinesLimit = int.tryParse(_klinesLimitController.text);
+    final parsedWorkers = int.tryParse(_workersController.text);
+    final parsedDays =
+        int.tryParse(_newListingDaysController.text) ?? newListingDays;
+
+    if (parsedTopN == null ||
+        parsedTopN <= 0 ||
+        parsedThreshold == null ||
+        parsedThreshold <= 0 ||
+        parsedKlinesLimit == null ||
+        parsedKlinesLimit < 121 ||
+        parsedWorkers == null ||
+        parsedWorkers <= 0 ||
+        parsedDays <= 0) {
+      setState(() {
+        _status =
+            '参数不合法，请检查 topN、threshold、klinesLimit（>=121）、workers（>0）、天数（>0）';
+      });
+      return;
+    }
+
+    topN = parsedTopN;
+    threshold = parsedThreshold;
+    klinesLimit = parsedKlinesLimit;
+    workers = parsedWorkers;
+    newListingDays = parsedDays;
+
+    setState(() {
+      _postDenseTrendBacktestRunning = true;
+      _postDenseTrendBacktestResults.clear();
+      _status =
+          '回测密集后持续方向(周期 $interval, 上市≤${parsedDays}天, topN=$parsedTopN) ...';
+    });
+    _log(
+      '开始回测密集后持续方向: interval=$interval topN=$parsedTopN threshold=$parsedThreshold '
+      'klinesLimit=$klinesLimit workers=$workers maxListingDays=$parsedDays',
+    );
+
+    try {
+      final symbols = await fetchTopSymbolsByQuoteVolume(
+        parsedTopN,
+        maxListingDays: parsedDays,
+      );
+
+      if (symbols.isEmpty) {
+        setState(() {
+          _status = '回测：未获取到任何 symbol';
+        });
+        return;
+      }
+
+      final matches = <PostDenseTrendResult>[];
+      final total = symbols.length;
+      var idx = 0;
+
+      Future<List<PostDenseTrendResult>> worker(
+        int localIdx,
+        String symbol,
+      ) async {
+        try {
+          final indicatorLimit = math.min(
+            math.max(klinesLimit, _indicatorWarmupKlines),
+            _binanceKlinesMaxLimit,
+          );
+          final bars = await fetchKlineBars(symbol, interval, indicatorLimit);
+          if (bars.length < 122) {
+            return const [];
+          }
+
+          final segments = backtestPostDenseTrendAllSegments(
+            bars,
+            threshold: parsedThreshold,
+          );
+          if (segments.isEmpty) {
+            return const [];
+          }
+
+          _log(
+            '[$localIdx/$total] $symbol 回测命中 ${segments.length} 段',
+          );
+          return segments
+              .map((s) => PostDenseTrendResult.fromDetection(symbol, s))
+              .toList(growable: false);
+        } catch (e) {
+          _log('[$localIdx/$total] $symbol 回测失败: $e');
+          return const [];
+        }
+      }
+
+      var i = 0;
+      while (i < total) {
+        final end = (i + workers) > total ? total : (i + workers);
+        final batch = symbols.sublist(i, end);
+        final futures = <Future<List<PostDenseTrendResult>>>[];
+        for (final symbol in batch) {
+          idx += 1;
+          futures.add(worker(idx, symbol));
+        }
+        final batchResults = await Future.wait(futures);
+        for (final list in batchResults) {
+          matches.addAll(list);
+        }
+        if (mounted) {
+          setState(() {
+            _status =
+                '回测密集后持续方向 [$idx/$total]，已找到 ${matches.length} 段';
+          });
+        }
+        i = end;
+      }
+
+      matches.sort((a, b) {
+        final bySymbol = a.symbol.compareTo(b.symbol);
+        if (bySymbol != 0) return bySymbol;
+        return a.startTimeUtc.compareTo(b.startTimeUtc);
+      });
+
+      if (!mounted) return;
+      setState(() {
+        _postDenseTrendBacktestResults.addAll(matches);
+        _status =
+            '回测完成，共 ${matches.length} 段 (周期 $interval, 上市≤${parsedDays}天)';
+      });
+      _log('回测密集后持续方向完成，段数: ${matches.length}');
+
+      if (matches.isNotEmpty) {
+        await _showPostDenseTrendBacktestDialog(matches);
+      } else {
+        await showDialog<void>(
+          context: context,
+          builder: (context) {
+            return AlertDialog(
+              title: Text('回测密集后持续方向 (周期 $interval, 上市≤${parsedDays}天)'),
+              content: const Text('未发现符合模型的历史时间段。'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = '回测密集后持续方向失败: $e';
+        });
+      }
+      _log('回测密集后持续方向失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _postDenseTrendBacktestRunning = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showPostDenseTrendDialog(
+    List<PostDenseTrendResult> results,
+  ) async {
+    if (!mounted || results.isEmpty) return;
+
+    final upResults = _sortedTrendResults(results, 'up');
+    final downResults = _sortedTrendResults(results, 'down');
+
+    Widget buildResultRow(PostDenseTrendResult m) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Text.rich(
+          TextSpan(
+            children: [
+              boldSymbolSpan(m.symbol),
+              TextSpan(
+                text:
+                    '  ${m.crossVoteLabel}\n'
+                    '${m.timeRangeLabel}\n'
+                    '密集=${m.denseSpreadPct.toStringAsFixed(4)}%  '
+                    '持续${m.barsSinceDense}根  '
+                    '净变动=${m.netMovePct.toStringAsFixed(4)}%  '
+                    '贴MA20=${m.alongMa20Pct.toStringAsFixed(1)}%  '
+                    '均偏差=${m.avgMa20DevPct.toStringAsFixed(4)}%',
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    Widget buildSection(String title, List<PostDenseTrendResult> section) {
+      if (section.isEmpty) return const SizedBox.shrink();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          ...section.map(buildResultRow),
+          const SizedBox(height: 12),
+        ],
+      );
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('密集后持续方向 (周期 $interval, 共 ${results.length} 个)'),
+          content: SizedBox(
+            width: 360,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  buildSection('— ↑ 上涨 (${upResults.length}) —', upResults),
+                  buildSection('— ↓ 下跌 (${downResults.length}) —', downResults),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  List<PostDenseTrendResult> _sortedTrendResults(
+    List<PostDenseTrendResult> results,
+    String direction,
+  ) {
+    return results.where((r) => r.direction == direction).toList()
+      ..sort((a, b) => b.netMovePct.abs().compareTo(a.netMovePct.abs()));
+  }
+
+  Widget _postDenseTrendListTile(
+    PostDenseTrendResult t, {
+    bool backtest = false,
+  }) {
+    final alongLabel = backtest ? '贴MA/EMA20' : '贴MA20';
+    return ListTile(
+      title: symbolBoldText(
+        t.symbol,
+        '  (${t.crossVoteLabel}, $interval)',
+      ),
+      subtitle: Text(
+        '${t.timeRangeLabel}\n'
+        '密集=${t.denseSpreadPct.toStringAsFixed(4)}%  '
+        '持续${t.barsSinceDense}根  '
+        '净变动=${t.netMovePct.toStringAsFixed(4)}%  '
+        '$alongLabel=${t.alongMa20Pct.toStringAsFixed(1)}%  '
+        '均偏差=${t.avgMa20DevPct.toStringAsFixed(4)}%',
+      ),
+    );
+  }
+
+  Future<void> _showPostDenseTrendBacktestDialog(
+    List<PostDenseTrendResult> results,
+  ) async {
+    if (!mounted || results.isEmpty) return;
+
+    final upResults = _sortedTrendResults(results, 'up');
+    final downResults = _sortedTrendResults(results, 'down');
+
+    Widget buildResultRow(PostDenseTrendResult m) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Text.rich(
+          TextSpan(
+            children: [
+              boldSymbolSpan(m.symbol),
+              TextSpan(
+                text:
+                    '  ${m.crossVoteLabel}\n'
+                    '${m.timeRangeLabel}\n'
+                    '密集=${m.denseSpreadPct.toStringAsFixed(4)}%  '
+                    '持续${m.barsSinceDense}根  '
+                    '净变动=${m.netMovePct.toStringAsFixed(4)}%  '
+                    '贴MA/EMA20=${m.alongMa20Pct.toStringAsFixed(1)}%  '
+                    '均偏差=${m.avgMa20DevPct.toStringAsFixed(4)}%',
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    Widget buildSection(String title, List<PostDenseTrendResult> section) {
+      if (section.isEmpty) return const SizedBox.shrink();
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          ...section.map(buildResultRow),
+          const SizedBox(height: 12),
+        ],
+      );
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('回测密集后持续方向 (周期 $interval, 共 ${results.length} 段)'),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '回测逻辑：密集区判叉 → 沿 MA20+EMA20 顺势；'
+                    '趋势 >10 根后破势则截段（含破势前最后一根）。',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                  const SizedBox(height: 12),
+                  buildSection('— ↑ 上涨 (${upResults.length}) —', upResults),
+                  buildSection('— ↓ 下跌 (${downResults.length}) —', downResults),
+                ],
               ),
             ),
           ),
@@ -485,8 +1034,17 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                   final d = r.listedAt.toUtc();
                   final date =
                       '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
-                  return Text(
-                    '$date  ${r.symbol}  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                  return Text.rich(
+                    TextSpan(
+                      children: [
+                        TextSpan(text: '$date  '),
+                        boldSymbolSpan(r.symbol),
+                        TextSpan(
+                          text:
+                              '  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                        ),
+                      ],
+                    ),
                   );
                 }).toList(),
               ),
@@ -630,16 +1188,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
 
         _log('任务 #${task.id} 开始新一轮扫描');
-        List<String> symbols;
-        if (task.onlyNewSymbols) {
-          final newList = await fetchNewlyListedSymbols(
-            task.newListingDays,
-            topN,
-          );
-          symbols = newList.map((e) => e.symbol).toList();
-        } else {
-          symbols = await fetchTopSymbolsByQuoteVolume(topN);
-        }
+        final parsedListingDays =
+            int.tryParse(_newListingDaysController.text) ?? newListingDays;
+        final symbols = await fetchTopSymbolsByQuoteVolume(
+          topN,
+          maxListingDays: parsedListingDays,
+        );
         if (symbols.isEmpty) {
           setState(() {
             task.status = '未获取到任何 symbol';
@@ -961,7 +1515,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                       ),
                                   decoration: const InputDecoration(
                                     labelText: 'threshold',
-                                    hintText: '例如 0.1',
+                                    hintText: '例如 0.2',
                                   ),
                                 ),
                               ),
@@ -979,7 +1533,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                       ),
                                   decoration: const InputDecoration(
                                     labelText: 'klinesLimit',
-                                    hintText: '例如 150 (>=121)',
+                                    hintText: '例如 1500 (>=121)',
                                   ),
                                 ),
                               ),
@@ -1011,7 +1565,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                       ),
                                   decoration: const InputDecoration(
                                     labelText: '天数',
-                                    hintText: '例如 7',
+                                    hintText: '上市不超过，例如 550',
                                   ),
                                 ),
                               ),
@@ -1047,6 +1601,46 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 child: OutlinedButton(
                                   onPressed: _scanNewListingsByLifetimeVolume,
                                   child: const Text('扫描新币(全时成交额排序)'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: ElevatedButton(
+                                  onPressed:
+                                      _postDenseTrendScanRunning ||
+                                          _postDenseTrendBacktestRunning
+                                      ? null
+                                      : _scanPostDenseTrend,
+                                  child: Text(
+                                    _postDenseTrendScanRunning
+                                        ? '扫描密集后持续方向...'
+                                        : '扫描密集后持续方向',
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Flexible(
+                                fit: FlexFit.loose,
+                                child: OutlinedButton(
+                                  onPressed:
+                                      _postDenseTrendBacktestRunning ||
+                                          _postDenseTrendScanRunning
+                                      ? null
+                                      : _backtestPostDenseTrend,
+                                  child: Text(
+                                    _postDenseTrendBacktestRunning
+                                        ? '回测密集后持续方向...'
+                                        : '回测密集后持续方向',
+                                  ),
                                 ),
                               ),
                             ],
@@ -1162,7 +1756,25 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                               entries.add(_TaskMatchEntry(task.interval, m));
                             }
                           }
-                          if (entries.isEmpty) {
+                          final hasTrend = _postDenseTrendResults.isNotEmpty;
+                          final hasBacktest = _postDenseTrendBacktestResults.isNotEmpty;
+                          final trendUp = _sortedTrendResults(
+                            _postDenseTrendResults,
+                            'up',
+                          );
+                          final trendDown = _sortedTrendResults(
+                            _postDenseTrendResults,
+                            'down',
+                          );
+                          final backtestUp = _sortedTrendResults(
+                            _postDenseTrendBacktestResults,
+                            'up',
+                          );
+                          final backtestDown = _sortedTrendResults(
+                            _postDenseTrendBacktestResults,
+                            'down',
+                          );
+                          if (entries.isEmpty && !hasTrend && !hasBacktest) {
                             return const Center(
                               child: Text(
                                 '暂无匹配结果',
@@ -1170,18 +1782,128 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                               ),
                             );
                           }
+                          final itemCount =
+                              (trendUp.isNotEmpty ? 1 + trendUp.length : 0) +
+                              (trendDown.isNotEmpty ? 1 + trendDown.length : 0) +
+                              (backtestUp.isNotEmpty ? 1 + backtestUp.length : 0) +
+                              (backtestDown.isNotEmpty
+                                  ? 1 + backtestDown.length
+                                  : 0) +
+                              (entries.isNotEmpty ? 1 + entries.length : 0);
                           return ListView.builder(
-                            itemCount: entries.length,
+                            itemCount: itemCount,
                             itemBuilder: (context, index) {
-                              final e = entries[index];
-                              return ListTile(
-                                title: Text(
-                                  '${e.match.symbol}  (${e.interval})',
-                                ),
-                                subtitle: Text(
-                                  'spread=${e.match.spreadPct.toStringAsFixed(4)}%',
-                                ),
-                              );
+                              var cursor = 0;
+
+                              if (trendUp.isNotEmpty) {
+                                if (index == cursor) {
+                                  return ListTile(
+                                    title: Text(
+                                      '— ↑ 上涨 (${trendUp.length}) —',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                cursor += 1;
+                                final upIdx = index - cursor;
+                                if (upIdx < trendUp.length) {
+                                  return _postDenseTrendListTile(trendUp[upIdx]);
+                                }
+                                cursor += trendUp.length;
+                              }
+
+                              if (trendDown.isNotEmpty) {
+                                if (index == cursor) {
+                                  return ListTile(
+                                    title: Text(
+                                      '— ↓ 下跌 (${trendDown.length}) —',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                cursor += 1;
+                                final downIdx = index - cursor;
+                                if (downIdx < trendDown.length) {
+                                  return _postDenseTrendListTile(
+                                    trendDown[downIdx],
+                                  );
+                                }
+                                cursor += trendDown.length;
+                              }
+
+                              if (backtestUp.isNotEmpty) {
+                                if (index == cursor) {
+                                  return ListTile(
+                                    title: Text(
+                                      '— 回测 ↑ 上涨 (${backtestUp.length}) —',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                cursor += 1;
+                                final upIdx = index - cursor;
+                                if (upIdx < backtestUp.length) {
+                                  return _postDenseTrendListTile(
+                                    backtestUp[upIdx],
+                                    backtest: true,
+                                  );
+                                }
+                                cursor += backtestUp.length;
+                              }
+
+                              if (backtestDown.isNotEmpty) {
+                                if (index == cursor) {
+                                  return ListTile(
+                                    title: Text(
+                                      '— 回测 ↓ 下跌 (${backtestDown.length}) —',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                cursor += 1;
+                                final downIdx = index - cursor;
+                                if (downIdx < backtestDown.length) {
+                                  return _postDenseTrendListTile(
+                                    backtestDown[downIdx],
+                                    backtest: true,
+                                  );
+                                }
+                                cursor += backtestDown.length;
+                              }
+
+                              if (entries.isNotEmpty) {
+                                if (index == cursor) {
+                                  return const ListTile(
+                                    title: Text(
+                                      '— EMA 收敛匹配 —',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  );
+                                }
+                                cursor += 1;
+                                final e = entries[index - cursor];
+                                return ListTile(
+                                  title: symbolBoldText(
+                                    e.match.symbol,
+                                    '  (${e.interval})',
+                                  ),
+                                  subtitle: Text(
+                                    'spread=${e.match.spreadPct.toStringAsFixed(4)}%',
+                                  ),
+                                );
+                              }
+
+                              return const SizedBox.shrink();
                             },
                           );
                         },
@@ -1304,6 +2026,48 @@ Future<dynamic> httpGetJson(
   throw Exception('请求失败，已重试 $maxRetries 次。最后错误: $lastError');
 }
 
+int? parseSymbolOnboardTimestampMs(Map<String, dynamic> symbolInfo) {
+  final timeField =
+      symbolInfo['onboardDate'] ??
+      symbolInfo['onboardTime'] ??
+      symbolInfo['listTime'] ??
+      symbolInfo['onboardAt'] ??
+      symbolInfo['onboardTimestamp'];
+  if (timeField is int) return timeField;
+  if (timeField is String) return int.tryParse(timeField);
+  return null;
+}
+
+Future<Map<String, int>> fetchUsdtPerpListingTimesMs() async {
+  final info =
+      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+  final listingTimes = <String, int>{};
+  if (info is! Map<String, dynamic>) return listingTimes;
+
+  final list = info['symbols'];
+  if (list is! List) return listingTimes;
+
+  for (final s in list) {
+    if (s is! Map<String, dynamic>) continue;
+    try {
+      if (s['contractType'] != 'PERPETUAL') continue;
+      if (s['status'] != 'TRADING') continue;
+      if (s['quoteAsset'] != 'USDT') continue;
+
+      final symbol = (s['symbol'] ?? '').toString();
+      if (symbol.isEmpty) continue;
+
+      final ts = parseSymbolOnboardTimestampMs(s);
+      if (ts != null) {
+        listingTimes[symbol] = ts;
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+  return listingTimes;
+}
+
 Future<Set<String>> fetchUsdtPerpetualSymbols() async {
   final info =
       await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
@@ -1334,10 +2098,23 @@ Future<Set<String>> fetchUsdtPerpetualSymbols() async {
   return symbols;
 }
 
-Future<List<String>> fetchTopSymbolsByQuoteVolume(int topN) async {
+Future<List<String>> fetchTopSymbolsByQuoteVolume(
+  int topN, {
+  int? maxListingDays,
+}) async {
   final usdtPerpSymbols = await fetchUsdtPerpetualSymbols();
   if (usdtPerpSymbols.isEmpty) {
     throw Exception('未能获取 USDT 永续合约列表');
+  }
+
+  Map<String, int>? listingTimes;
+  int? listingCutoffMs;
+  if (maxListingDays != null && maxListingDays > 0) {
+    listingTimes = await fetchUsdtPerpListingTimesMs();
+    listingCutoffMs = DateTime.now()
+        .toUtc()
+        .subtract(Duration(days: maxListingDays))
+        .millisecondsSinceEpoch;
   }
 
   final tickers =
@@ -1353,6 +2130,13 @@ Future<List<String>> fetchTopSymbolsByQuoteVolume(int topN) async {
     try {
       final symbol = (item['symbol'] ?? '').toString();
       if (!usdtPerpSymbols.contains(symbol)) continue;
+
+      if (listingCutoffMs != null) {
+        final listedAtMs = listingTimes?[symbol];
+        if (listedAtMs == null || listedAtMs < listingCutoffMs) {
+          continue;
+        }
+      }
 
       final qv =
           double.tryParse((item['quoteVolume'] ?? '0').toString()) ?? 0.0;
@@ -1689,6 +2473,22 @@ Future<List<double>> fetchKlines(
   String interval,
   int limit,
 ) async {
+  final bars = await fetchKlineBars(symbol, interval, limit);
+  return bars.map((bar) => bar.close).toList(growable: false);
+}
+
+class KlineBar {
+  final DateTime openTimeUtc;
+  final double close;
+
+  const KlineBar({required this.openTimeUtc, required this.close});
+}
+
+Future<List<KlineBar>> fetchKlineBars(
+  String symbol,
+  String interval,
+  int limit,
+) async {
   final klines =
       await httpGetJson(
             '$binanceFapiBase/fapi/v1/klines',
@@ -1700,17 +2500,27 @@ Future<List<double>> fetchKlines(
     return const [];
   }
 
-  final closes = <double>[];
+  final bars = <KlineBar>[];
   for (final k in klines) {
     try {
       if (k is List && k.length > 4) {
-        closes.add(double.parse(k[4].toString()));
+        final openTimeMs = int.tryParse(k[0].toString());
+        if (openTimeMs == null) continue;
+        bars.add(
+          KlineBar(
+            openTimeUtc: DateTime.fromMillisecondsSinceEpoch(
+              openTimeMs,
+              isUtc: true,
+            ),
+            close: double.parse(k[4].toString()),
+          ),
+        );
       }
     } catch (_) {
       continue;
     }
   }
-  return closes;
+  return bars;
 }
 
 double? ema(List<double> values, int span) {
@@ -1760,6 +2570,722 @@ ConvergeResult isDense6(List<double> averages, double threshold) {
   }
   final spread = (mx - mn) / mnAbs;
   return ConvergeResult(spread <= threshold, spread);
+}
+
+List<double> emaSeries(List<double> values, int span) {
+  if (values.isEmpty) return const [];
+  final alpha = 2.0 / (span + 1.0);
+  final series = <double>[values.first];
+  var e = values.first;
+  for (var i = 1; i < values.length; i++) {
+    e = alpha * values[i] + (1.0 - alpha) * e;
+    series.add(e);
+  }
+  return series;
+}
+
+List<double?> maSeries(List<double> values, int span) {
+  final series = List<double?>.filled(values.length, null);
+  if (values.length < span) return series;
+
+  var sum = 0.0;
+  for (var i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= span) {
+      sum -= values[i - span];
+    }
+    if (i >= span - 1) {
+      series[i] = sum / span;
+    }
+  }
+  return series;
+}
+
+/// 密集点前后截取窗口（各 15 根，不足则以已有 K 线为准）。
+const int denseCrossWindowBars = 15;
+
+(int, int) denseCrossWindow(int denseIdx, int length) {
+  final start = math.max(0, denseIdx - denseCrossWindowBars);
+  final end = math.min(length - 1, denseIdx + denseCrossWindowBars);
+  return (start, end);
+}
+
+/// 在 (startIdx, endIdx] 内寻找快/慢线首次金叉/死叉。
+String? detectFirstCrossInWindow(
+  List<double> fast,
+  List<double> slow,
+  int startIdx,
+  int endIdx,
+) {
+  if (startIdx >= endIdx) return null;
+
+  for (var i = startIdx + 1; i <= endIdx; i++) {
+    final prevFast = fast[i - 1];
+    final currFast = fast[i];
+    final prevSlow = slow[i - 1];
+    final currSlow = slow[i];
+    if (prevFast <= prevSlow && currFast > currSlow) return 'up';
+    if (prevFast >= prevSlow && currFast < currSlow) return 'down';
+  }
+  return null;
+}
+
+String? detectFirstCrossInWindowNullable(
+  List<double?> fast,
+  List<double?> slow,
+  int startIdx,
+  int endIdx,
+) {
+  if (startIdx >= endIdx) return null;
+
+  for (var i = startIdx + 1; i <= endIdx; i++) {
+    final prevFast = fast[i - 1];
+    final currFast = fast[i];
+    final prevSlow = slow[i - 1];
+    final currSlow = slow[i];
+    if (prevFast == null ||
+        currFast == null ||
+        prevSlow == null ||
+        currSlow == null) {
+      continue;
+    }
+    if (prevFast <= prevSlow && currFast > currSlow) return 'up';
+    if (prevFast >= prevSlow && currFast < currSlow) return 'down';
+  }
+  return null;
+}
+
+class _CrossVoteSummary {
+  final String? direction;
+  final int upVotes;
+  final int downVotes;
+
+  const _CrossVoteSummary({
+    required this.direction,
+    required this.upVotes,
+    required this.downVotes,
+  });
+
+  int get totalVotes => upVotes + downVotes;
+}
+
+/// 在密集点前后各 [denseCrossWindowBars] 根窗口内，
+/// 对 EMA/MA 的 20/60/120 六组快慢线对综合投票判定金叉/死叉。
+_CrossVoteSummary resolveComprehensiveCrossDirection({
+  required List<double> ema20s,
+  required List<double> ema60s,
+  required List<double> ema120s,
+  required List<double?> ma20s,
+  required List<double?> ma60s,
+  required List<double?> ma120s,
+  required int denseIdx,
+  required int length,
+}) {
+  final (windowStart, windowEnd) = denseCrossWindow(denseIdx, length);
+  return resolveComprehensiveCrossDirectionInWindow(
+    ema20s: ema20s,
+    ema60s: ema60s,
+    ema120s: ema120s,
+    ma20s: ma20s,
+    ma60s: ma60s,
+    ma120s: ma120s,
+    windowStart: windowStart,
+    windowEnd: windowEnd,
+  );
+}
+
+_CrossVoteSummary resolveComprehensiveCrossDirectionInWindow({
+  required List<double> ema20s,
+  required List<double> ema60s,
+  required List<double> ema120s,
+  required List<double?> ma20s,
+  required List<double?> ma60s,
+  required List<double?> ma120s,
+  required int windowStart,
+  required int windowEnd,
+}) {
+  if (windowStart >= windowEnd) {
+    return const _CrossVoteSummary(direction: null, upVotes: 0, downVotes: 0);
+  }
+
+  var upVotes = 0;
+  var downVotes = 0;
+
+  void vote(String? direction) {
+    if (direction == 'up') {
+      upVotes += 1;
+    } else if (direction == 'down') {
+      downVotes += 1;
+    }
+  }
+
+  vote(detectFirstCrossInWindow(ema20s, ema60s, windowStart, windowEnd));
+  vote(detectFirstCrossInWindow(ema20s, ema120s, windowStart, windowEnd));
+  vote(detectFirstCrossInWindow(ema60s, ema120s, windowStart, windowEnd));
+  vote(detectFirstCrossInWindowNullable(ma20s, ma60s, windowStart, windowEnd));
+  vote(detectFirstCrossInWindowNullable(ma20s, ma120s, windowStart, windowEnd));
+  vote(detectFirstCrossInWindowNullable(ma60s, ma120s, windowStart, windowEnd));
+
+  if (upVotes + downVotes == 0 || upVotes == downVotes) {
+    return _CrossVoteSummary(
+      direction: null,
+      upVotes: upVotes,
+      downVotes: downVotes,
+    );
+  }
+
+  return _CrossVoteSummary(
+    direction: upVotes > downVotes ? 'up' : 'down',
+    upVotes: upVotes,
+    downVotes: downVotes,
+  );
+}
+
+class _PostDenseTrendDetection {
+  final String direction;
+  final double denseSpread;
+  final int barsSinceDense;
+  final double netMovePct;
+  final double avgMa20DevPct;
+  final double alongMa20Pct;
+  final DateTime startTimeUtc;
+  final DateTime endTimeUtc;
+  final int crossUpVotes;
+  final int crossDownVotes;
+  final int denseEndIdx;
+  final int trendEndIdx;
+
+  const _PostDenseTrendDetection({
+    required this.direction,
+    required this.denseSpread,
+    required this.barsSinceDense,
+    required this.netMovePct,
+    required this.avgMa20DevPct,
+    required this.alongMa20Pct,
+    required this.startTimeUtc,
+    required this.endTimeUtc,
+    required this.crossUpVotes,
+    required this.crossDownVotes,
+    required this.denseEndIdx,
+    required this.trendEndIdx,
+  });
+}
+
+String formatUtcDateTime(DateTime dt) {
+  final d = dt.toUtc();
+  final month = d.month.toString().padLeft(2, '0');
+  final day = d.day.toString().padLeft(2, '0');
+  final hour = d.hour.toString().padLeft(2, '0');
+  final minute = d.minute.toString().padLeft(2, '0');
+  return '${d.year}-$month-$day $hour:$minute UTC';
+}
+
+String formatUtcDate(DateTime dt) {
+  final d = dt.toUtc();
+  final month = d.month.toString().padLeft(2, '0');
+  final day = d.day.toString().padLeft(2, '0');
+  return '${d.year}-$month-$day';
+}
+
+ConvergeResult? dense6AtIndex(
+  int index,
+  List<double> ema20s,
+  List<double> ema60s,
+  List<double> ema120s,
+  List<double?> ma20s,
+  List<double?> ma60s,
+  List<double?> ma120s,
+  double threshold,
+) {
+  if (index < 119) return null;
+  final ma20 = ma20s[index];
+  final ma60 = ma60s[index];
+  final ma120 = ma120s[index];
+  if (ma20 == null || ma60 == null || ma120 == null) return null;
+
+  return isDense6([
+    ema20s[index],
+    ema60s[index],
+    ema120s[index],
+    ma20,
+    ma60,
+    ma120,
+  ], threshold);
+}
+
+/// 从最近一根密集 K 线向前回溯，找到连续密集区间的起始索引。
+int findDenseClusterStartIdx(
+  int denseEndIdx,
+  int searchStart,
+  List<double> ema20s,
+  List<double> ema60s,
+  List<double> ema120s,
+  List<double?> ma20s,
+  List<double?> ma60s,
+  List<double?> ma120s,
+  double threshold,
+) {
+  var startIdx = denseEndIdx;
+  for (var i = denseEndIdx - 1; i >= searchStart; i--) {
+    final dense = dense6AtIndex(
+      i,
+      ema20s,
+      ema60s,
+      ema120s,
+      ma20s,
+      ma60s,
+      ma120s,
+      threshold,
+    );
+    if (dense == null || !dense.ok) break;
+    startIdx = i;
+  }
+  return startIdx;
+}
+
+/// 从 [cursor] 起找下一段连续密集区，返回 (起始索引, 结束索引)。
+(int, int)? findNextDenseClusterBounds(
+  _PostDenseTrendIndicatorContext ctx,
+  int cursor,
+  double threshold,
+) {
+  if (cursor > ctx.closes.length - 2) return null;
+
+  int? clusterStart;
+  int? clusterEnd;
+  for (var i = cursor; i <= ctx.closes.length - 2; i++) {
+    final dense = dense6AtIndex(
+      i,
+      ctx.ema20s,
+      ctx.ema60s,
+      ctx.ema120s,
+      ctx.ma20s,
+      ctx.ma60s,
+      ctx.ma120s,
+      threshold,
+    );
+    if (dense != null && dense.ok) {
+      clusterStart ??= i;
+      clusterEnd = i;
+    } else if (clusterStart != null) {
+      break;
+    }
+  }
+
+  if (clusterStart == null || clusterEnd == null) return null;
+  return (clusterStart, clusterEnd);
+}
+
+class _PostDenseTrendIndicatorContext {
+  final List<double> closes;
+  final List<double> ema20s;
+  final List<double> ema60s;
+  final List<double> ema120s;
+  final List<double?> ma20s;
+  final List<double?> ma60s;
+  final List<double?> ma120s;
+  final int searchStart;
+
+  _PostDenseTrendIndicatorContext._({
+    required this.closes,
+    required this.ema20s,
+    required this.ema60s,
+    required this.ema120s,
+    required this.ma20s,
+    required this.ma60s,
+    required this.ma120s,
+    required this.searchStart,
+  });
+
+  factory _PostDenseTrendIndicatorContext.fromBars(List<KlineBar> bars) {
+    final closes = bars.map((bar) => bar.close).toList(growable: false);
+    return _PostDenseTrendIndicatorContext._(
+      closes: closes,
+      ema20s: emaSeries(closes, 20),
+      ema60s: emaSeries(closes, 60),
+      ema120s: emaSeries(closes, 120),
+      ma20s: maSeries(closes, 20),
+      ma60s: maSeries(closes, 60),
+      ma120s: maSeries(closes, 120),
+      searchStart: 119,
+    );
+  }
+}
+
+_PostDenseTrendDetection? evaluatePostDenseTrendSegment(
+  _PostDenseTrendIndicatorContext ctx,
+  List<KlineBar> bars, {
+  required int denseEndIdx,
+  required int trendEndIdx,
+  required double threshold,
+}) {
+  if (ctx.closes.length < 122 || threshold <= 0) return null;
+  if (trendEndIdx <= denseEndIdx + 1) return null;
+  if (trendEndIdx >= ctx.closes.length) return null;
+
+  final dense = dense6AtIndex(
+    denseEndIdx,
+    ctx.ema20s,
+    ctx.ema60s,
+    ctx.ema120s,
+    ctx.ma20s,
+    ctx.ma60s,
+    ctx.ma120s,
+    threshold,
+  );
+  if (dense == null || !dense.ok) return null;
+
+  final denseStartIdx = findDenseClusterStartIdx(
+    denseEndIdx,
+    ctx.searchStart,
+    ctx.ema20s,
+    ctx.ema60s,
+    ctx.ema120s,
+    ctx.ma20s,
+    ctx.ma60s,
+    ctx.ma120s,
+    threshold,
+  );
+
+  final barsSinceDense = trendEndIdx - denseEndIdx;
+  if (barsSinceDense < 2) return null;
+
+  final crossSummary = resolveComprehensiveCrossDirection(
+    ema20s: ctx.ema20s,
+    ema60s: ctx.ema60s,
+    ema120s: ctx.ema120s,
+    ma20s: ctx.ma20s,
+    ma60s: ctx.ma60s,
+    ma120s: ctx.ma120s,
+    denseIdx: denseEndIdx,
+    length: trendEndIdx + 1,
+  );
+  final crossDirection = crossSummary.direction;
+  if (crossDirection == null) return null;
+
+  final anchor = ctx.closes[denseEndIdx];
+  final endClose = ctx.closes[trendEndIdx];
+  if (anchor == 0) return null;
+
+  final netDirection = endClose > anchor
+      ? 'up'
+      : (endClose < anchor ? 'down' : null);
+  if (netDirection == null || netDirection != crossDirection) return null;
+
+  final direction = crossDirection;
+  final netMovePct = (endClose - anchor) / anchor.abs() * 100.0;
+  if (netMovePct.abs() < threshold * 100.0 * 0.3) return null;
+
+  final ma20AtDense = ctx.ma20s[denseEndIdx];
+  final ma20AtEnd = ctx.ma20s[trendEndIdx];
+  if (ma20AtDense == null || ma20AtEnd == null) return null;
+  if (direction == 'up' && ma20AtEnd <= ma20AtDense) return null;
+  if (direction == 'down' && ma20AtEnd >= ma20AtDense) return null;
+
+  var alongMa20Count = 0;
+  var totalBars = 0;
+  var devSum = 0.0;
+
+  for (var i = denseEndIdx + 1; i <= trendEndIdx; i++) {
+    final price = ctx.closes[i];
+    final ma20 = ctx.ma20s[i];
+    final ma120 = ctx.ma120s[i];
+    if (ma20 == null || ma120 == null) continue;
+
+    final prevClose = ctx.closes[i - 1];
+    final prevMa120 = ctx.ma120s[i - 1];
+    if (prevMa120 != null) {
+      if (direction == 'up' && prevClose >= prevMa120 && price < ma120) {
+        return null;
+      }
+      if (direction == 'down' && prevClose <= prevMa120 && price > ma120) {
+        return null;
+      }
+    }
+
+    totalBars += 1;
+    final ma20Abs = ma20.abs();
+    if (ma20Abs == 0) continue;
+
+    final signedDev = (price - ma20) / ma20Abs;
+    devSum += signedDev.abs();
+
+    final alongMa20 = direction == 'up'
+        ? signedDev >= -threshold
+        : signedDev <= threshold;
+    if (alongMa20) alongMa20Count += 1;
+  }
+
+  if (totalBars < 2) return null;
+
+  final alongMa20Pct = alongMa20Count / totalBars * 100.0;
+  if (alongMa20Pct < 75.0) return null;
+
+  return _PostDenseTrendDetection(
+    direction: direction,
+    denseSpread: dense.spread,
+    barsSinceDense: barsSinceDense,
+    netMovePct: netMovePct,
+    avgMa20DevPct: devSum / totalBars * 100.0,
+    alongMa20Pct: alongMa20Pct,
+    startTimeUtc: bars[denseStartIdx].openTimeUtc,
+    endTimeUtc: bars[trendEndIdx].openTimeUtc,
+    crossUpVotes: crossSummary.upVotes,
+    crossDownVotes: crossSummary.downVotes,
+    denseEndIdx: denseEndIdx,
+    trendEndIdx: trendEndIdx,
+  );
+}
+
+/// 在已加载 K 线中寻找最近一次 6 线密集后的有效趋势（结束于最新 K 线）。
+_PostDenseTrendDetection? detectPostDenseTrend(
+  List<KlineBar> bars, {
+  required double threshold,
+}) {
+  if (bars.length < 122 || threshold <= 0) return null;
+
+  final ctx = _PostDenseTrendIndicatorContext.fromBars(bars);
+  int? denseEndIdx;
+
+  for (var i = ctx.closes.length - 2; i >= ctx.searchStart; i--) {
+    final dense = dense6AtIndex(
+      i,
+      ctx.ema20s,
+      ctx.ema60s,
+      ctx.ema120s,
+      ctx.ma20s,
+      ctx.ma60s,
+      ctx.ma120s,
+      threshold,
+    );
+    if (dense != null && dense.ok) {
+      denseEndIdx = i;
+      break;
+    }
+  }
+
+  if (denseEndIdx == null) return null;
+
+  return evaluatePostDenseTrendSegment(
+    ctx,
+    bars,
+    denseEndIdx: denseEndIdx,
+    trendEndIdx: ctx.closes.length - 1,
+    threshold: threshold,
+  );
+}
+
+/// 回测判定：收盘价同时贴合 MA20 与 EMA20，沿叉的方向运行。
+bool isAlongMa20AndEma20(
+  _PostDenseTrendIndicatorContext ctx,
+  int index,
+  String direction,
+  double threshold,
+) {
+  final price = ctx.closes[index];
+  final ma20 = ctx.ma20s[index];
+  if (ma20 == null) return false;
+
+  final ma20Abs = ma20.abs();
+  if (ma20Abs == 0) return false;
+
+  final ema20 = ctx.ema20s[index];
+  final ema20Abs = ema20.abs();
+  if (ema20Abs == 0) return false;
+
+  final maDev = (price - ma20) / ma20Abs;
+  final emaDev = (price - ema20) / ema20Abs;
+
+  if (direction == 'up') {
+    return maDev >= -threshold && emaDev >= -threshold;
+  }
+  return maDev <= threshold && emaDev <= threshold;
+}
+
+/// 回测：在密集区内判叉，随后逐根检查 MA20+EMA20 贴线；>10 根后破势则截段记录。
+const int backtestMinTrendBars = 10;
+
+_PostDenseTrendDetection? evaluateBacktestDenseCluster(
+  _PostDenseTrendIndicatorContext ctx,
+  List<KlineBar> bars, {
+  required int clusterStart,
+  required int clusterEnd,
+  required double threshold,
+}) {
+  final dense = dense6AtIndex(
+    clusterEnd,
+    ctx.ema20s,
+    ctx.ema60s,
+    ctx.ema120s,
+    ctx.ma20s,
+    ctx.ma60s,
+    ctx.ma120s,
+    threshold,
+  );
+  if (dense == null || !dense.ok) return null;
+
+  final crossWindowStart = math.max(ctx.searchStart, clusterStart);
+  final crossWindowEnd = math.min(
+    ctx.closes.length - 1,
+    clusterEnd + denseCrossWindowBars,
+  );
+  final crossSummary = resolveComprehensiveCrossDirectionInWindow(
+    ema20s: ctx.ema20s,
+    ema60s: ctx.ema60s,
+    ema120s: ctx.ema120s,
+    ma20s: ctx.ma20s,
+    ma60s: ctx.ma60s,
+    ma120s: ctx.ma120s,
+    windowStart: crossWindowStart,
+    windowEnd: crossWindowEnd,
+  );
+  final direction = crossSummary.direction;
+  if (direction == null) return null;
+
+  var trendBarCount = 0;
+  int? lastTrendBar;
+  var devSum = 0.0;
+
+  for (var i = clusterEnd + 1; i < ctx.closes.length; i++) {
+    if (!isAlongMa20AndEma20(ctx, i, direction, threshold)) {
+      break;
+    }
+    trendBarCount += 1;
+    lastTrendBar = i;
+
+    final ma20 = ctx.ma20s[i];
+    final ema20 = ctx.ema20s[i];
+    if (ma20 != null && ma20.abs() > 0) {
+      devSum +=
+          ((ctx.closes[i] - ma20).abs() / ma20.abs() +
+              (ctx.closes[i] - ema20).abs() / ema20.abs()) /
+          2.0;
+    }
+  }
+
+  if (trendBarCount <= backtestMinTrendBars || lastTrendBar == null) {
+    return null;
+  }
+
+  final anchor = ctx.closes[clusterEnd];
+  if (anchor == 0) return null;
+
+  final endClose = ctx.closes[lastTrendBar];
+  final netDirection = endClose > anchor
+      ? 'up'
+      : (endClose < anchor ? 'down' : null);
+  if (netDirection == null || netDirection != direction) return null;
+
+  return _PostDenseTrendDetection(
+    direction: direction,
+    denseSpread: dense.spread,
+    barsSinceDense: lastTrendBar - clusterEnd,
+    netMovePct: (endClose - anchor) / anchor.abs() * 100.0,
+    avgMa20DevPct: devSum / trendBarCount * 100.0,
+    alongMa20Pct: 100.0,
+    startTimeUtc: bars[clusterStart].openTimeUtc,
+    endTimeUtc: bars[lastTrendBar].openTimeUtc,
+    crossUpVotes: crossSummary.upVotes,
+    crossDownVotes: crossSummary.downVotes,
+    denseEndIdx: clusterEnd,
+    trendEndIdx: lastTrendBar,
+  );
+}
+
+/// 在历史 K 线中找出所有符合回测模型的非重叠时间段。
+List<_PostDenseTrendDetection> backtestPostDenseTrendAllSegments(
+  List<KlineBar> bars, {
+  required double threshold,
+}) {
+  if (bars.length < 122 || threshold <= 0) return const [];
+
+  final ctx = _PostDenseTrendIndicatorContext.fromBars(bars);
+  final segments = <_PostDenseTrendDetection>[];
+  var cursor = ctx.searchStart;
+
+  while (cursor <= ctx.closes.length - 3) {
+    final cluster = findNextDenseClusterBounds(ctx, cursor, threshold);
+    if (cluster == null) break;
+
+    final clusterStart = cluster.$1;
+    final clusterEnd = cluster.$2;
+
+    final segment = evaluateBacktestDenseCluster(
+      ctx,
+      bars,
+      clusterStart: clusterStart,
+      clusterEnd: clusterEnd,
+      threshold: threshold,
+    );
+
+    if (segment != null) {
+      segments.add(segment);
+      cursor = segment.trendEndIdx + 1;
+    } else {
+      cursor = clusterEnd + 1;
+    }
+  }
+
+  return segments;
+}
+
+class PostDenseTrendResult {
+  final String symbol;
+  final String direction;
+  final double denseSpreadPct;
+  final int barsSinceDense;
+  final double netMovePct;
+  final double avgMa20DevPct;
+  final double alongMa20Pct;
+  final DateTime startTimeUtc;
+  final DateTime endTimeUtc;
+  final int crossUpVotes;
+  final int crossDownVotes;
+
+  PostDenseTrendResult({
+    required this.symbol,
+    required this.direction,
+    required this.denseSpreadPct,
+    required this.barsSinceDense,
+    required this.netMovePct,
+    required this.avgMa20DevPct,
+    required this.alongMa20Pct,
+    required this.startTimeUtc,
+    required this.endTimeUtc,
+    required this.crossUpVotes,
+    required this.crossDownVotes,
+  });
+
+  factory PostDenseTrendResult.fromDetection(
+    String symbol,
+    _PostDenseTrendDetection detection,
+  ) {
+    return PostDenseTrendResult(
+      symbol: symbol,
+      direction: detection.direction,
+      denseSpreadPct: detection.denseSpread * 100.0,
+      barsSinceDense: detection.barsSinceDense,
+      netMovePct: detection.netMovePct,
+      avgMa20DevPct: detection.avgMa20DevPct,
+      alongMa20Pct: detection.alongMa20Pct,
+      startTimeUtc: detection.startTimeUtc,
+      endTimeUtc: detection.endTimeUtc,
+      crossUpVotes: detection.crossUpVotes,
+      crossDownVotes: detection.crossDownVotes,
+    );
+  }
+
+  String get crossVoteLabel =>
+      direction == 'up'
+      ? '金叉 ${crossUpVotes}/${crossUpVotes + crossDownVotes}'
+      : '死叉 ${crossDownVotes}/${crossUpVotes + crossDownVotes}';
+
+  String get directionLabel => direction == 'up'
+      ? '↑ 上涨($crossVoteLabel)'
+      : '↓ 下跌($crossVoteLabel)';
+
+  String get timeRangeLabel =>
+      '${formatUtcDate(startTimeUtc)} ~ ${formatUtcDateTime(endTimeUtc)}';
 }
 
 class MatchResult {

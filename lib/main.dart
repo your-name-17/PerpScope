@@ -4,21 +4,77 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/gestures.dart' show TapGestureRecognizer;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'package:url_launcher/url_launcher.dart' show launchUrl, LaunchMode;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'web_notifications/web_notification_service_stub.dart'
     if (dart.library.html) 'web_notifications/web_notification_service_web.dart';
 
+class _AlphaTokenInfo {
+  final String chainName;
+  final String contractAddress;
+  const _AlphaTokenInfo(this.chainName, this.contractAddress);
+}
+
+String binanceFuturesUrl(String symbol) {
+  if (_EmaScannerPageState._linkMode == 'futures') {
+    return 'https://www.binance.com/en/futures/$symbol';
+  }
+
+  // spot_alpha mode: auto-detect
+  final cache = _EmaScannerPageState._spotSymbols;
+  if (cache != null && cache.isNotEmpty) {
+    // Try exact futures symbol first (e.g. BTCUSDT)
+    if (cache.contains(symbol)) {
+      return 'https://www.binance.com/en/trade/${symbol}?type=spot';
+    }
+    // Try underscore format (e.g. BTC_USDT)
+    final usdtIdx = symbol.lastIndexOf('USDT');
+    if (usdtIdx > 0) {
+      final spotSymbol = '${symbol.substring(0, usdtIdx)}_USDT';
+      if (cache.contains(spotSymbol)) {
+        return 'https://www.binance.com/en/trade/$spotSymbol?type=spot';
+      }
+    }
+  }
+
+  // Fallback to alpha
+  final base = symbol.replaceAll(RegExp(r'USDT$'), '');
+  final alphaCache = _EmaScannerPageState._alphaTokens;
+  if (alphaCache != null && alphaCache.isNotEmpty) {
+    final info = alphaCache[base] ?? alphaCache[base.toLowerCase()];
+    if (info != null) {
+      return 'https://www.binance.com/en/alpha/${info.chainName.toLowerCase()}/${info.contractAddress}';
+    }
+  }
+  return 'https://www.binance.com/en/alpha?keyword=$base';
+}
+
 TextSpan boldSymbolSpan(String symbol) => TextSpan(
   text: symbol,
-  style: const TextStyle(fontWeight: FontWeight.bold),
+  style: const TextStyle(
+    fontWeight: FontWeight.bold,
+    color: Colors.blue,
+    decoration: TextDecoration.underline,
+  ),
+  recognizer: TapGestureRecognizer()
+    ..onTap = () => launchUrl(
+          Uri.parse(binanceFuturesUrl(symbol)),
+          mode: LaunchMode.externalApplication,
+        ),
 );
 
 Widget symbolBoldText(String symbol, String suffix) {
   return Text.rich(
-    TextSpan(children: [boldSymbolSpan(symbol), TextSpan(text: suffix)]),
+    TextSpan(
+      children: [
+        boldSymbolSpan(symbol),
+        TextSpan(text: suffix),
+      ],
+    ),
   );
 }
 
@@ -52,6 +108,69 @@ class EmaScannerPage extends StatefulWidget {
 
 class _EmaScannerPageState extends State<EmaScannerPage>
     with WidgetsBindingObserver {
+  static String _linkMode = 'futures'; // 'futures' | 'spot_alpha'
+  static Set<String>? _spotSymbols;
+  static bool _spotFetching = false;
+  static Map<String, _AlphaTokenInfo>? _alphaTokens;
+  static bool _alphaFetching = false;
+
+  static Future<void> _ensureSpotSymbols() async {
+    if (_spotSymbols != null || _spotFetching) return;
+    _spotFetching = true;
+    try {
+      final info = await httpGetJson('https://api.binance.com/api/v3/exchangeInfo') as dynamic;
+      final symbols = <String>{};
+      if (info is Map<String, dynamic>) {
+        final list = info['symbols'];
+        if (list is List) {
+          for (final s in list) {
+            if (s is! Map<String, dynamic>) continue;
+            final sym = (s['symbol'] ?? '').toString();
+            if (s['status'] == 'TRADING' && sym.isNotEmpty) {
+              symbols.add(sym);
+            }
+          }
+        }
+      }
+      _spotSymbols = symbols;
+      debugPrint('[EMA] 已缓存 ${symbols.length} 个现货交易对');
+    } catch (e) {
+      debugPrint('[EMA] 获取现货交易对失败: $e');
+    } finally {
+      _spotFetching = false;
+    }
+  }
+
+  static Future<void> _ensureAlphaTokens() async {
+    if (_alphaTokens != null || _alphaFetching) return;
+    _alphaFetching = true;
+    try {
+      final resp = await httpGetJson(
+        'https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list',
+      ) as dynamic;
+      final tokens = <String, _AlphaTokenInfo>{};
+      if (resp is Map<String, dynamic>) {
+        final list = resp['data'];
+        if (list is List) {
+          for (final t in list) {
+            if (t is! Map<String, dynamic>) continue;
+            final sym = (t['symbol'] ?? '').toString();
+            final chain = (t['chainName'] ?? '').toString();
+            final addr = (t['contractAddress'] ?? '').toString();
+            if (sym.isNotEmpty && chain.isNotEmpty && addr.isNotEmpty) {
+              tokens[sym.toUpperCase()] = _AlphaTokenInfo(chain, addr);
+            }
+          }
+        }
+      }
+      _alphaTokens = tokens;
+      debugPrint('[EMA] 已缓存 ${tokens.length} 个 Alpha 代币');
+    } catch (e) {
+      debugPrint('[EMA] 获取 Alpha 代币列表失败: $e');
+    } finally {
+      _alphaFetching = false;
+    }
+  }
   String _status = '';
 
   // 为了让 EMA120 更贴近交易所图表，需要更长历史进行预热。
@@ -111,6 +230,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     );
 
     _initNotifications();
+    _ensureSpotSymbols();
+    _ensureAlphaTokens();
   }
 
   @override
@@ -395,20 +516,39 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     final parsedDays =
         int.tryParse(_newListingDaysController.text) ?? newListingDays;
     final parsedTopN = int.tryParse(_topNController.text) ?? topN;
+    final parsedWorkers =
+        int.tryParse(_workersController.text) ?? workers;
     if (parsedDays <= 0) {
       setState(() {
         _status = '天数必须为正整数';
       });
       return;
     }
+    if (parsedTopN <= 0 || parsedWorkers == null || parsedWorkers <= 0) {
+      setState(() {
+        _status =
+            '参数不合法，请检查 topN、workers（>0）、天数（>0）';
+      });
+      return;
+    }
 
     setState(() {
-      _status = '扫描新币(${parsedDays}天, 按全时成交额排序, top=${parsedTopN}) ...';
+      _status =
+          '扫描新币(${parsedDays}天, 按全时成交额排序, top=${parsedTopN}, workers=$parsedWorkers) ...';
     });
     try {
       final results = await fetchNewlyListedSymbolsByLifetimeVolume(
-        parsedDays,
-        parsedTopN,
+        days: parsedDays,
+        topN: parsedTopN,
+        workers: parsedWorkers,
+        onProgress: (current, total) {
+          if (mounted) {
+            setState(() {
+              _status =
+                  '扫描新币(${parsedDays}天, 按全时成交额排序, top=${parsedTopN}) [$current/$total] ...';
+            });
+          }
+        },
       );
       if (results.isEmpty) {
         setState(() {
@@ -475,8 +615,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         TextSpan(text: '$date  '),
                         boldSymbolSpan(r.symbol),
                         TextSpan(
-                          text:
-                              '  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                          text: '  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
                         ),
                       ],
                     ),
@@ -569,10 +708,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             return null;
           }
 
-          final trend = detectPostDenseTrend(
-            bars,
-            threshold: parsedThreshold,
-          );
+          final trend = detectPostDenseTrend(bars, threshold: parsedThreshold);
           if (trend == null) {
             _log('[$localIdx/$total] $symbol 不满足密集后持续方向');
             return null;
@@ -613,8 +749,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
         if (mounted) {
           setState(() {
-            _status =
-                '扫描密集后持续方向 [$idx/$total]，已找到 ${matches.length} 个';
+            _status = '扫描密集后持续方向 [$idx/$total]，已找到 ${matches.length} 个';
           });
         }
         i = end;
@@ -747,9 +882,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
             return const [];
           }
 
-          _log(
-            '[$localIdx/$total] $symbol 回测命中 ${segments.length} 段',
-          );
+          _log('[$localIdx/$total] $symbol 回测命中 ${segments.length} 段');
           return segments
               .map((s) => PostDenseTrendResult.fromDetection(symbol, s))
               .toList(growable: false);
@@ -774,8 +907,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
         }
         if (mounted) {
           setState(() {
-            _status =
-                '回测密集后持续方向 [$idx/$total]，已找到 ${matches.length} 段';
+            _status = '回测密集后持续方向 [$idx/$total]，已找到 ${matches.length} 段';
           });
         }
         i = end;
@@ -866,10 +998,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           ...section.map(buildResultRow),
           const SizedBox(height: 12),
@@ -919,10 +1048,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   }) {
     final alongLabel = backtest ? '贴MA/EMA20' : '贴MA20';
     return ListTile(
-      title: symbolBoldText(
-        t.symbol,
-        '  (${t.crossVoteLabel}, $interval)',
-      ),
+      title: symbolBoldText(t.symbol, '  (${t.crossVoteLabel}, $interval)'),
       subtitle: Text(
         '${t.timeRangeLabel}\n'
         '密集=${t.denseSpreadPct.toStringAsFixed(4)}%  '
@@ -970,10 +1096,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            title,
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           ...section.map(buildResultRow),
           const SizedBox(height: 12),
@@ -1040,8 +1163,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         TextSpan(text: '$date  '),
                         boldSymbolSpan(r.symbol),
                         TextSpan(
-                          text:
-                              '  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                          text: '  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
                         ),
                       ],
                     ),
@@ -1665,6 +1787,35 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                               ),
                             ],
                           ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              const Text('链接: '),
+                              DropdownButton<String>(
+                                value: _linkMode,
+                                items: const [
+                                  DropdownMenuItem(
+                                    value: 'futures',
+                                    child: Text('合约'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: 'spot_alpha',
+                                    child: Text('现货/Alpha'),
+                                  ),
+                                ],
+                                onChanged: (v) {
+                                  if (v == null) return;
+                                  setState(() {
+                                    _linkMode = v;
+                                  });
+                                  if (v == 'spot_alpha') {
+                                    _ensureSpotSymbols();
+                                    _ensureAlphaTokens();
+                                  }
+                                },
+                              ),
+                            ],
+                          ),
                         ],
                       ),
                     ),
@@ -1757,7 +1908,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                             }
                           }
                           final hasTrend = _postDenseTrendResults.isNotEmpty;
-                          final hasBacktest = _postDenseTrendBacktestResults.isNotEmpty;
+                          final hasBacktest =
+                              _postDenseTrendBacktestResults.isNotEmpty;
                           final trendUp = _sortedTrendResults(
                             _postDenseTrendResults,
                             'up',
@@ -1784,8 +1936,12 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                           }
                           final itemCount =
                               (trendUp.isNotEmpty ? 1 + trendUp.length : 0) +
-                              (trendDown.isNotEmpty ? 1 + trendDown.length : 0) +
-                              (backtestUp.isNotEmpty ? 1 + backtestUp.length : 0) +
+                              (trendDown.isNotEmpty
+                                  ? 1 + trendDown.length
+                                  : 0) +
+                              (backtestUp.isNotEmpty
+                                  ? 1 + backtestUp.length
+                                  : 0) +
                               (backtestDown.isNotEmpty
                                   ? 1 + backtestDown.length
                                   : 0) +
@@ -1809,7 +1965,9 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                 cursor += 1;
                                 final upIdx = index - cursor;
                                 if (upIdx < trendUp.length) {
-                                  return _postDenseTrendListTile(trendUp[upIdx]);
+                                  return _postDenseTrendListTile(
+                                    trendUp[upIdx],
+                                  );
                                 }
                                 cursor += trendUp.length;
                               }
@@ -2154,24 +2312,43 @@ Future<List<String>> fetchTopSymbolsByQuoteVolume(
 }
 
 /// 返回最近 `days` 天内上新的币种，按自发行以来的累计 futures USDT 成交额排序。
-/// 只检查发行时间落在 `days` 天以内的币种；成交额通过逐笔成交聚合计算。
-Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume(
-  int days,
-  int topN,
-) async {
+Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume({
+  required int days,
+  required int topN,
+  required int workers,
+  void Function(int current, int total)? onProgress,
+}) async {
   final info =
       await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
-  final results = <_NewListingResult>[];
-  if (info is! Map<String, dynamic>) return results;
+  if (info is! Map<String, dynamic>) return <_NewListingResult>[];
 
   final list = info['symbols'];
-  if (list is! List) return results;
+  if (list is! List) return <_NewListingResult>[];
 
   final cutoffMs = DateTime.now()
       .toUtc()
       .subtract(Duration(days: days))
       .millisecondsSinceEpoch;
 
+  // 预取 24h 成交量数据，用于初筛排序。
+  final tickersRaw =
+      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+  final Map<String, double> vol24h = {};
+  if (tickersRaw is List) {
+    for (final t in tickersRaw) {
+      if (t is! Map<String, dynamic>) continue;
+      try {
+        final sym = (t['symbol'] ?? '').toString();
+        final qv = double.tryParse((t['quoteVolume'] ?? '0').toString()) ?? 0.0;
+        vol24h[sym] = qv;
+      } catch (_) {
+        continue;
+      }
+    }
+  }
+
+  // 收集符合天数条件的新币。
+  final candidates = <_NewListingResult>[];
   for (final s in list) {
     if (s is! Map<String, dynamic>) continue;
     try {
@@ -2194,20 +2371,11 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume(
       if (ts == null) continue;
 
       if (ts >= cutoffMs) {
-        // 通过逐笔成交聚合计算 futures 合约自发行以来的累计 USDT 成交额。
-        double lifetimeVolume = 0.0;
-        try {
-          lifetimeVolume = await fetchFuturesLifetimeQuoteVolume(symbol, ts);
-        } catch (e) {
-          debugPrint('[EMA] 获取 $symbol futures累计成交额失败: $e');
-          lifetimeVolume = 0.0;
-        }
-
-        results.add(
+        candidates.add(
           _NewListingResult(
             symbol: symbol,
             listedAt: DateTime.fromMillisecondsSinceEpoch(ts, isUtc: true),
-            quoteVolume: lifetimeVolume,
+            quoteVolume: vol24h[symbol] ?? 0.0,
           ),
         );
       }
@@ -2216,7 +2384,60 @@ Future<List<_NewListingResult>> fetchNewlyListedSymbolsByLifetimeVolume(
     }
   }
 
-  // 按lifetime成交额降序，并取前 topN
+  if (candidates.isEmpty) return <_NewListingResult>[];
+
+  // 按 24h 成交额降序，只对头部候选计算全时成交额。
+  candidates.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
+  final refineCount = (topN * 2).clamp(1, candidates.length);
+  final toRefine = candidates.take(refineCount).toList();
+
+  debugPrint(
+    '[EMA] 全时成交额扫描: days=$days topN=$topN 共 ${candidates.length} 个新币, '
+    '对前 $refineCount 个计算全时成交额 (workers=$workers)',
+  );
+
+  // 按 workers 并行分批获取全时成交额。
+  final effectiveWorkers = workers.clamp(1, 16);
+  final volumes = <String, double>{};
+  var idx = 0;
+  while (idx < toRefine.length) {
+    final end = (idx + effectiveWorkers).clamp(0, toRefine.length);
+    final batch = toRefine.sublist(idx, end);
+    final futures = <Future<void>>[];
+    for (final c in batch) {
+      futures.add(
+        (() async {
+          try {
+            final vol = await fetchFuturesLifetimeQuoteVolume(
+              c.symbol,
+              c.listedAt.millisecondsSinceEpoch,
+            );
+            volumes[c.symbol] = vol;
+          } catch (e) {
+            debugPrint('[EMA] 获取 ${c.symbol} futures累计成交额失败: $e');
+          }
+        })(),
+      );
+    }
+    await Future.wait(futures);
+    idx = end;
+    onProgress?.call(idx, toRefine.length);
+    debugPrint('[EMA] 全时成交额 [$idx/${toRefine.length}]');
+    if (idx < toRefine.length) {
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+  }
+
+  // 用实际成交量重建结果列表。
+  final results = toRefine.map((c) {
+    final vol = volumes[c.symbol] ?? c.quoteVolume;
+    return _NewListingResult(
+      symbol: c.symbol,
+      listedAt: c.listedAt,
+      quoteVolume: vol,
+    );
+  }).toList();
+
   results.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
   return results.take(topN).toList();
 }
@@ -2251,26 +2472,11 @@ Future<double> fetchFuturesLifetimeQuoteVolume(
 
     if (klines is List && klines.isNotEmpty) {
       double total = 0.0;
-      var idx = 0;
       for (final k in klines) {
         try {
           if (k is List && k.length > 7) {
             final quoteVol = double.tryParse(k[7].toString()) ?? 0.0;
-            // 如需逐根 K 线明细，取消下面注释：
-            // final openTimeMs = k.isNotEmpty
-            //     ? int.tryParse(k[0].toString())
-            //     : null;
-            // final openTime = openTimeMs == null
-            //     ? 'unknown'
-            //     : DateTime.fromMillisecondsSinceEpoch(
-            //         openTimeMs,
-            //         isUtc: true,
-            //       ).toIso8601String();
-            // debugPrint(
-            //   '[EMA][VOL] $symbol kline[$idx] open=$openTime quoteVol=${quoteVol.toStringAsFixed(2)}',
-            // );
             total += quoteVol;
-            idx += 1;
           }
         } catch (_) {
           continue;
@@ -2281,6 +2487,9 @@ Future<double> fetchFuturesLifetimeQuoteVolume(
       );
       return total;
     }
+
+    // klines 返回了非数组（如 API 业务错误），抛出异常让调用方处理。
+    throw Exception('klines 返回异常数据: $klines');
   } catch (e) {
     debugPrint('[EMA] 日线聚合失败，准备回退到逐笔聚合: $e');
   }
@@ -3275,14 +3484,12 @@ class PostDenseTrendResult {
     );
   }
 
-  String get crossVoteLabel =>
-      direction == 'up'
+  String get crossVoteLabel => direction == 'up'
       ? '金叉 ${crossUpVotes}/${crossUpVotes + crossDownVotes}'
       : '死叉 ${crossDownVotes}/${crossUpVotes + crossDownVotes}';
 
-  String get directionLabel => direction == 'up'
-      ? '↑ 上涨($crossVoteLabel)'
-      : '↓ 下跌($crossVoteLabel)';
+  String get directionLabel =>
+      direction == 'up' ? '↑ 上涨($crossVoteLabel)' : '↓ 下跌($crossVoteLabel)';
 
   String get timeRangeLabel =>
       '${formatUtcDate(startTimeUtc)} ~ ${formatUtcDateTime(endTimeUtc)}';

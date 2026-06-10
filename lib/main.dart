@@ -53,6 +53,18 @@ String binanceFuturesUrl(String symbol) {
   return 'https://www.binance.com/en/alpha?keyword=$base';
 }
 
+String formatVolume(double volume) {
+  if (volume >= 1e9) {
+    return '${(volume / 1e9).toStringAsFixed(2)}B';
+  } else if (volume >= 1e6) {
+    return '${(volume / 1e6).toStringAsFixed(2)}M';
+  } else if (volume >= 1e3) {
+    return '${(volume / 1e3).toStringAsFixed(2)}K';
+  } else {
+    return volume.toStringAsFixed(2);
+  }
+}
+
 TextSpan boldSymbolSpan(String symbol) => TextSpan(
   text: symbol,
   style: const TextStyle(
@@ -62,9 +74,9 @@ TextSpan boldSymbolSpan(String symbol) => TextSpan(
   ),
   recognizer: TapGestureRecognizer()
     ..onTap = () => launchUrl(
-          Uri.parse(binanceFuturesUrl(symbol)),
-          mode: LaunchMode.externalApplication,
-        ),
+      Uri.parse(binanceFuturesUrl(symbol)),
+      mode: LaunchMode.externalApplication,
+    ),
 );
 
 Widget symbolBoldText(String symbol, String suffix) {
@@ -114,11 +126,19 @@ class _EmaScannerPageState extends State<EmaScannerPage>
   static Map<String, _AlphaTokenInfo>? _alphaTokens;
   static bool _alphaFetching = false;
 
+  DateTime? listingStartDate;
+  DateTime? listingEndDate;
+
+  List<ListingVolumeResult> listingResults = [];
+  bool listingSearchRunning = false;
+
   static Future<void> _ensureSpotSymbols() async {
     if (_spotSymbols != null || _spotFetching) return;
     _spotFetching = true;
     try {
-      final info = await httpGetJson('https://api.binance.com/api/v3/exchangeInfo') as dynamic;
+      final info =
+          await httpGetJson('https://api.binance.com/api/v3/exchangeInfo')
+              as dynamic;
       final symbols = <String>{};
       if (info is Map<String, dynamic>) {
         final list = info['symbols'];
@@ -145,9 +165,11 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     if (_alphaTokens != null || _alphaFetching) return;
     _alphaFetching = true;
     try {
-      final resp = await httpGetJson(
-        'https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list',
-      ) as dynamic;
+      final resp =
+          await httpGetJson(
+                'https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list',
+              )
+              as dynamic;
       final tokens = <String, _AlphaTokenInfo>{};
       if (resp is Map<String, dynamic>) {
         final list = resp['data'];
@@ -171,6 +193,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
       _alphaFetching = false;
     }
   }
+
   String _status = '';
 
   // 为了让 EMA120 更贴近交易所图表，需要更长历史进行预热。
@@ -516,8 +539,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     final parsedDays =
         int.tryParse(_newListingDaysController.text) ?? newListingDays;
     final parsedTopN = int.tryParse(_topNController.text) ?? topN;
-    final parsedWorkers =
-        int.tryParse(_workersController.text) ?? workers;
+    final parsedWorkers = int.tryParse(_workersController.text) ?? workers;
     if (parsedDays <= 0) {
       setState(() {
         _status = '天数必须为正整数';
@@ -526,8 +548,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
     if (parsedTopN <= 0 || parsedWorkers == null || parsedWorkers <= 0) {
       setState(() {
-        _status =
-            '参数不合法，请检查 topN、workers（>0）、天数（>0）';
+        _status = '参数不合法，请检查 topN、workers（>0）、天数（>0）';
       });
       return;
     }
@@ -615,7 +636,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         TextSpan(text: '$date  '),
                         boldSymbolSpan(r.symbol),
                         TextSpan(
-                          text: '  24h成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                          text: '  24h成交额=${formatVolume(r.quoteVolume)}',
                         ),
                       ],
                     ),
@@ -624,6 +645,46 @@ class _EmaScannerPageState extends State<EmaScannerPage>
               ),
             ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _showListingRangeDialog(
+    List<ListingVolumeResult> results,
+  ) async {
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('指定时间发行币种'),
+
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: results.map((r) {
+                  return Text.rich(
+                    TextSpan(
+                      children: [
+                        boldSymbolSpan(r.symbol),
+
+                        TextSpan(text: '  ${formatVolume(r.quoteVolume)}'),
+                      ],
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
@@ -1163,7 +1224,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                         TextSpan(text: '$date  '),
                         boldSymbolSpan(r.symbol),
                         TextSpan(
-                          text: '  全时成交额=${r.quoteVolume.toStringAsFixed(2)}',
+                          text: '  全时成交额=${formatVolume(r.quoteVolume)}',
                         ),
                       ],
                     ),
@@ -1550,6 +1611,32 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     }
   }
 
+  Future<void> _searchListings() async {
+    if (listingStartDate == null || listingEndDate == null) {
+      return;
+    }
+
+    setState(() {
+      listingSearchRunning = true;
+    });
+
+    try {
+      final result = await fetchSymbolsListedBetweenDates(
+        startDate: listingStartDate!,
+        endDate: listingEndDate!,
+      );
+
+      setState(() {
+        listingResults = result;
+      });
+      await _showListingRangeDialog(result);
+    } finally {
+      setState(() {
+        listingSearchRunning = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     const double taskPanelHeight = 300;
@@ -1724,6 +1811,74 @@ class _EmaScannerPageState extends State<EmaScannerPage>
                                   onPressed: _scanNewListingsByLifetimeVolume,
                                   child: const Text('扫描新币(全时成交额排序)'),
                                 ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+
+                          Row(
+                            children: [
+                              ElevatedButton(
+                                onPressed: () async {
+                                  final d = await showDatePicker(
+                                    context: context,
+                                    firstDate: DateTime(2020),
+                                    lastDate: DateTime.now(),
+                                    initialDate:
+                                        listingStartDate ?? DateTime.now(),
+                                  );
+
+                                  if (d != null) {
+                                    setState(() {
+                                      listingStartDate = d;
+                                    });
+                                  }
+                                },
+                                child: Text(
+                                  listingStartDate == null
+                                      ? '起始日期'
+                                      : listingStartDate!
+                                            .toString()
+                                            .split(' ')
+                                            .first,
+                                ),
+                              ),
+
+                              const SizedBox(width: 10),
+
+                              ElevatedButton(
+                                onPressed: () async {
+                                  final d = await showDatePicker(
+                                    context: context,
+                                    firstDate: DateTime(2020),
+                                    lastDate: DateTime.now(),
+                                    initialDate:
+                                        listingEndDate ?? DateTime.now(),
+                                  );
+
+                                  if (d != null) {
+                                    setState(() {
+                                      listingEndDate = d;
+                                    });
+                                  }
+                                },
+                                child: Text(
+                                  listingEndDate == null
+                                      ? '终止日期'
+                                      : listingEndDate!
+                                            .toString()
+                                            .split(' ')
+                                            .first,
+                                ),
+                              ),
+
+                              const SizedBox(width: 10),
+
+                              ElevatedButton(
+                                onPressed: listingSearchRunning
+                                    ? null
+                                    : _searchListings,
+                                child: const Text('查询发行币种'),
                               ),
                             ],
                           ),
@@ -2224,6 +2379,78 @@ Future<Map<String, int>> fetchUsdtPerpListingTimesMs() async {
     }
   }
   return listingTimes;
+}
+
+Future<List<ListingVolumeResult>> fetchSymbolsListedBetweenDates({
+  required DateTime startDate,
+  required DateTime endDate,
+}) async {
+  final exchangeInfo =
+      await httpGetJson('$binanceFapiBase/fapi/v1/exchangeInfo') as dynamic;
+
+  final ticker24h =
+      await httpGetJson('$binanceFapiBase/fapi/v1/ticker/24hr') as dynamic;
+
+  if (exchangeInfo is! Map<String, dynamic>) {
+    return [];
+  }
+
+  final symbols = exchangeInfo['symbols'];
+  if (symbols is! List) {
+    return [];
+  }
+
+  final volumeMap = <String, double>{};
+
+  if (ticker24h is List) {
+    for (final item in ticker24h) {
+      if (item is! Map<String, dynamic>) continue;
+
+      final symbol = item['symbol']?.toString() ?? '';
+
+      final volume =
+          double.tryParse(item['quoteVolume']?.toString() ?? '0') ?? 0;
+
+      volumeMap[symbol] = volume;
+    }
+  }
+
+  final results = <ListingVolumeResult>[];
+
+  final startMs = startDate.millisecondsSinceEpoch;
+  final endMs = endDate.millisecondsSinceEpoch;
+
+  for (final s in symbols) {
+    if (s is! Map<String, dynamic>) continue;
+
+    try {
+      if (s['contractType'] != 'PERPETUAL') continue;
+      if (s['status'] != 'TRADING') continue;
+      if (s['quoteAsset'] != 'USDT') continue;
+
+      final symbol = s['symbol']?.toString() ?? '';
+
+      final listedAt = parseSymbolOnboardTimestampMs(s);
+
+      if (listedAt == null) continue;
+
+      if (listedAt < startMs || listedAt > endMs) {
+        continue;
+      }
+
+      results.add(
+        ListingVolumeResult(
+          symbol: symbol,
+          listingTime: listedAt,
+          quoteVolume: volumeMap[symbol] ?? 0,
+        ),
+      );
+    } catch (_) {}
+  }
+
+  results.sort((a, b) => b.quoteVolume.compareTo(a.quoteVolume));
+
+  return results;
 }
 
 Future<Set<String>> fetchUsdtPerpetualSymbols() async {
@@ -3519,4 +3746,16 @@ class _SymbolVolume {
   final double quoteVolume;
 
   _SymbolVolume({required this.symbol, required this.quoteVolume});
+}
+
+class ListingVolumeResult {
+  final String symbol;
+  final int listingTime;
+  final double quoteVolume;
+
+  ListingVolumeResult({
+    required this.symbol,
+    required this.listingTime,
+    required this.quoteVolume,
+  });
 }

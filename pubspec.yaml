@@ -1,5 +1,5 @@
-name: trading
-description: "A new Flutter project."
+name: perp_scope
+description: "PerpScope - Binance USDT perpetual contract scanner."
 publish_to: 'none'
 version: 0.1.0
 

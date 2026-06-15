@@ -1,4 +1,4 @@
-package com.example.trading
+package com.example.perpscope
 
 import io.flutter.embedding.android.FlutterActivity
 

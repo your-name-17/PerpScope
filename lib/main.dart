@@ -101,7 +101,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Binance EMA+MA Scanner',
+      title: 'PerpScope',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
@@ -281,8 +281,8 @@ class _EmaScannerPageState extends State<EmaScannerPage>
 
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const windowsInit = WindowsInitializationSettings(
-      appName: 'Binance EMA+MA Scanner',
-      appUserModelId: 'dev.trading.ema_scanner',
+      appName: 'PerpScope',
+      appUserModelId: 'dev.perpscope.app',
       guid: 'd49b0314-ee7a-4626-bf79-97cdb8a991bb',
     );
 
@@ -1643,7 +1643,7 @@ class _EmaScannerPageState extends State<EmaScannerPage>
     const double resultPanelHeight = 720;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Binance USDT EMA+MA(20/60/120) 扫描器')),
+      appBar: AppBar(title: const Text('PerpScope')),
       body: LayoutBuilder(
         builder: (context, constraints) {
           return SingleChildScrollView(
